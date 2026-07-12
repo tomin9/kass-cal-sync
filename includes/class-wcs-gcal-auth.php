@@ -123,9 +123,11 @@ class WCS_GCal_Auth {
 
     /**
      * Callback URL musí byť totožná s tou, ktorú ste zadali v Google Cloud Console.
+     * Stránka pluginu je registrovaná cez add_options_page(), takže jej skutočná
+     * adresa je options-general.php (nie admin.php).
      */
     public function get_redirect_uri(): string {
-        return admin_url( 'admin.php?page=wcs-gcal-sync' );
+        return admin_url( 'options-general.php?page=wcs-gcal-sync' );
     }
 
     /**
