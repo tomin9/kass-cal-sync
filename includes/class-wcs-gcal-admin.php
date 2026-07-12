@@ -27,8 +27,12 @@ class WCS_GCal_Admin {
         add_action( 'admin_init',            [ $this, 'register_settings' ] );
         add_action( 'admin_init',            [ $this, 'handle_oauth_callback' ] );
         add_action( 'admin_init',            [ $this, 'handle_manual_sync' ] );
+        add_action( 'admin_init',            [ $this, 'handle_cancel_sync' ] );
         add_action( 'admin_init',            [ $this, 'handle_disconnect' ] );
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
+
+        // AJAX endpoint pre priebeh hromadnej synchronizácie
+        add_action( 'wp_ajax_wcs_gcal_sync_status', [ $this, 'ajax_sync_status' ] );
 
         // Zobraz stav sync v zozname podujatí
         add_filter( 'manage_class_posts_columns',       [ $this, 'add_gcal_column' ] );
@@ -109,7 +113,7 @@ class WCS_GCal_Admin {
     }
 
     /**
-     * Spustí manuálnu synchronizáciu všetkých podujatí.
+     * Spustí hromadnú synchronizáciu všetkých podujatí na pozadí.
      */
     public function handle_manual_sync(): void {
         if ( ! isset( $_POST['wcs_gcal_sync_all'] ) ) {
@@ -122,15 +126,66 @@ class WCS_GCal_Admin {
             return;
         }
 
-        $result = $this->sync->sync_all();
+        $result = $this->sync->start_background_sync();
 
-        $redirect = add_query_arg( [
-            'wcs_sync_success' => $result['success'],
-            'wcs_sync_errors'  => $result['errors'],
-        ], admin_url( 'options-general.php?page=wcs-gcal-sync' ) );
+        $redirect = add_query_arg(
+            'wcs_sync_started',
+            (int) $result['total'],
+            admin_url( 'options-general.php?page=wcs-gcal-sync' )
+        );
 
         wp_safe_redirect( $redirect );
         exit;
+    }
+
+    /**
+     * Zruší bežiacu hromadnú synchronizáciu.
+     */
+    public function handle_cancel_sync(): void {
+        if ( ! isset( $_GET['wcs_gcal_cancel_sync'] ) ) {
+            return;
+        }
+        if ( ! check_admin_referer( 'wcs_gcal_cancel_sync' ) ) {
+            return;
+        }
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return;
+        }
+
+        $this->sync->cancel_background_sync();
+
+        wp_safe_redirect( admin_url( 'options-general.php?page=wcs-gcal-sync&wcs_sync_cancelled=1' ) );
+        exit;
+    }
+
+    /**
+     * Vráti stav hromadnej synchronizácie ako JSON (pre polling z admin stránky).
+     */
+    public function ajax_sync_status(): void {
+        check_ajax_referer( 'wcs_gcal_sync_status' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( null, 403 );
+        }
+
+        $job = $this->sync->get_job();
+
+        if ( $job ) {
+            // Popostrčí WP-Cron, keby dávka na pozadí zaspala
+            spawn_cron();
+
+            wp_send_json_success( [
+                'running' => true,
+                'total'   => $job['total'],
+                'done'    => $job['total'] - count( $job['post_ids'] ),
+                'success' => $job['success'],
+                'errors'  => $job['errors'],
+            ] );
+        }
+
+        wp_send_json_success( [
+            'running' => false,
+            'last'    => get_option( WCS_GCal_Sync::OPTION_LAST_RESULT ) ?: null,
+        ] );
     }
 
     /**
@@ -348,35 +403,94 @@ class WCS_GCal_Admin {
                         Synchronizácia
                     </div>
                     <div class="wcs-gcal-card-body">
-                        <p>
-                            Automatická synchronizácia prebieha pri každom uložení podujatia.<br>
-                            Toto tlačidlo synchronizuje <strong>všetky existujúce podujatia</strong> naraz
-                            (vhodné pri prvom spustení).
-                        </p>
-                        <form method="post">
-                            <?php wp_nonce_field( 'wcs_gcal_sync_all' ); ?>
-                            <button type="submit" name="wcs_gcal_sync_all" value="1" class="button button-primary">
-                                <span class="dashicons dashicons-update"></span>
-                                Synchronizovať všetky podujatia
-                            </button>
-                        </form>
+                        <?php $job = $this->sync->get_job(); ?>
 
-                        <?php
-                        // Štatistiky
-                        $total_synced = (int) ( new WP_Query( [
-                            'post_type'      => 'class',
-                            'post_status'    => 'publish',
-                            'posts_per_page' => -1,
-                            'meta_query'     => [ [ 'key' => WCS_GCal_Sync::META_GCAL_EVENT_ID, 'compare' => 'EXISTS' ] ],
-                            'fields'         => 'ids',
-                        ] ) )->found_posts;
+                        <?php if ( $job ) : ?>
+                            <?php
+                            $done    = $job['total'] - count( $job['post_ids'] );
+                            $percent = $job['total'] ? (int) round( $done / $job['total'] * 100 ) : 0;
+                            ?>
+                            <p>
+                                Prebieha synchronizácia na pozadí – môžete túto stránku
+                                zavrieť, synchronizácia bude pokračovať sama.
+                            </p>
+                            <div class="wcs-progress">
+                                <div id="wcs-sync-bar" class="wcs-progress-bar" style="width:<?php echo $percent; ?>%"></div>
+                            </div>
+                            <p class="wcs-stats">
+                                Spracovaných: <strong><span id="wcs-sync-done"><?php echo $done; ?></span></strong>
+                                / <strong><?php echo (int) $job['total']; ?></strong> podujatí
+                                (chyby: <span id="wcs-sync-errors"><?php echo (int) $job['errors']; ?></span>)
+                            </p>
+                            <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'options-general.php?page=wcs-gcal-sync&wcs_gcal_cancel_sync=1' ), 'wcs_gcal_cancel_sync' ) ); ?>"
+                               class="button button-secondary"
+                               onclick="return confirm('Naozaj zrušiť prebiehajúcu synchronizáciu?')">
+                                Zrušiť synchronizáciu
+                            </a>
 
-                        $total_all = (int) wp_count_posts( 'class' )->publish;
-                        ?>
-                        <p class="wcs-stats">
-                            Synchronizovaných: <strong><?php echo $total_synced; ?></strong>
-                            / <strong><?php echo $total_all; ?></strong> podujatí
-                        </p>
+                            <script>
+                            ( function () {
+                                var url = <?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) . '?action=wcs_gcal_sync_status&_ajax_nonce=' . wp_create_nonce( 'wcs_gcal_sync_status' ) ); ?>;
+                                function poll() {
+                                    fetch( url, { credentials: 'same-origin' } )
+                                        .then( function ( r ) { return r.json(); } )
+                                        .then( function ( res ) {
+                                            if ( ! res.success ) { setTimeout( poll, 5000 ); return; }
+                                            var d = res.data;
+                                            if ( ! d.running ) { window.location.reload(); return; }
+                                            document.getElementById( 'wcs-sync-done' ).textContent   = d.done;
+                                            document.getElementById( 'wcs-sync-errors' ).textContent = d.errors;
+                                            document.getElementById( 'wcs-sync-bar' ).style.width    = ( d.total ? Math.round( d.done / d.total * 100 ) : 0 ) + '%';
+                                            setTimeout( poll, 3000 );
+                                        } )
+                                        .catch( function () { setTimeout( poll, 5000 ); } );
+                                }
+                                setTimeout( poll, 3000 );
+                            } )();
+                            </script>
+
+                        <?php else : ?>
+                            <p>
+                                Automatická synchronizácia prebieha pri každom uložení podujatia.<br>
+                                Toto tlačidlo synchronizuje <strong>všetky existujúce podujatia</strong>
+                                po dávkach na pozadí (vhodné pri prvom spustení).
+                            </p>
+                            <form method="post">
+                                <?php wp_nonce_field( 'wcs_gcal_sync_all' ); ?>
+                                <button type="submit" name="wcs_gcal_sync_all" value="1" class="button button-primary">
+                                    <span class="dashicons dashicons-update"></span>
+                                    Synchronizovať všetky podujatia
+                                </button>
+                            </form>
+
+                            <?php
+                            $last_result = get_option( WCS_GCal_Sync::OPTION_LAST_RESULT );
+                            if ( is_array( $last_result ) ) :
+                                ?>
+                                <p class="wcs-stats">
+                                    Posledná synchronizácia (<?php echo esc_html( wp_date( 'j.n.Y H:i', (int) $last_result['finished'] ) ); ?>):
+                                    <strong><?php echo (int) $last_result['success']; ?></strong> úspešne,
+                                    <strong><?php echo (int) $last_result['errors']; ?></strong> chýb
+                                </p>
+                            <?php endif; ?>
+
+                            <?php
+                            // Štatistiky
+                            $total_synced = (int) ( new WP_Query( [
+                                'post_type'      => 'class',
+                                'post_status'    => 'publish',
+                                'posts_per_page' => -1,
+                                'meta_query'     => [ [ 'key' => WCS_GCal_Sync::META_GCAL_EVENT_ID, 'compare' => 'EXISTS' ] ],
+                                'fields'         => 'ids',
+                            ] ) )->found_posts;
+
+                            $total_all = (int) wp_count_posts( 'class' )->publish;
+                            ?>
+                            <p class="wcs-stats">
+                                Synchronizovaných: <strong><?php echo $total_synced; ?></strong>
+                                / <strong><?php echo $total_all; ?></strong> podujatí
+                            </p>
+                        <?php endif; ?>
                     </div>
                 </div>
                 <?php endif; ?>
@@ -401,11 +515,12 @@ class WCS_GCal_Admin {
             $msg = esc_html( rawurldecode( (string) $_GET['wcs_error'] ) );
             echo '<div class="notice notice-error is-dismissible"><p>Chyba: ' . $msg . '</p></div>';
         }
-        if ( isset( $_GET['wcs_sync_success'] ) ) {
-            $s = (int) $_GET['wcs_sync_success'];
-            $e = (int) $_GET['wcs_sync_errors'];
-            $color = $e > 0 ? 'notice-warning' : 'notice-success';
-            echo "<div class='notice {$color} is-dismissible'><p>&#10003; Synchronizácia dokončená: <strong>{$s}</strong> úspešne, <strong>{$e}</strong> chýb.</p></div>";
+        if ( isset( $_GET['wcs_sync_started'] ) ) {
+            $total = (int) $_GET['wcs_sync_started'];
+            echo "<div class='notice notice-success is-dismissible'><p>&#10003; Synchronizácia <strong>{$total}</strong> podujatí bola spustená na pozadí.</p></div>";
+        }
+        if ( isset( $_GET['wcs_sync_cancelled'] ) ) {
+            echo '<div class="notice notice-info is-dismissible"><p>Synchronizácia bola zrušená.</p></div>';
         }
     }
 }

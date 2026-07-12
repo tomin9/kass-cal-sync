@@ -2,7 +2,7 @@
 /**
  * Plugin Name:  WCS Google Calendar Sync
  * Description:  Synchronizuje podujatia z Events Schedule WP Plugin (Curly Themes) do Google Calendar.
- * Version:      1.1.0
+ * Version:      1.2.0
  * Author:       Custom
  * Text Domain:  wcs-gcal-sync
  * Requires PHP: 7.4
@@ -10,7 +10,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WCS_GCAL_VERSION',    '1.1.0' );
+define( 'WCS_GCAL_VERSION',    '1.2.0' );
 define( 'WCS_GCAL_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'WCS_GCAL_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
