@@ -25,6 +25,21 @@ class WCS_GCal_Sync {
     /** Post meta kľúč, kde ukladáme Google Calendar event ID. */
     const META_GCAL_EVENT_ID = '_wcs_gcal_event_id';
 
+    /** Cron hook pre spracovanie jednej dávky hromadnej synchronizácie. */
+    const CRON_HOOK = 'wcs_gcal_process_sync_batch';
+
+    /** Option so stavom bežiacej hromadnej synchronizácie. */
+    const OPTION_SYNC_JOB = 'wcs_gcal_sync_job';
+
+    /** Option s výsledkom poslednej dokončenej hromadnej synchronizácie. */
+    const OPTION_LAST_RESULT = 'wcs_gcal_last_sync_result';
+
+    /** Maximálny počet podujatí spracovaných v jednej dávke. */
+    const BATCH_SIZE = 25;
+
+    /** Maximálny čas (v sekundách) jedného behu dávky. */
+    const BATCH_TIME_LIMIT = 20;
+
     public function __construct( private WCS_GCal_API $api ) {}
 
     // -----------------------------------------------------------------------
@@ -40,6 +55,9 @@ class WCS_GCal_Sync {
 
         // Trvalé vymazanie
         add_action( 'before_delete_post', [ $this, 'on_delete_post' ], 10, 2 );
+
+        // Dávkové spracovanie hromadnej synchronizácie na pozadí
+        add_action( self::CRON_HOOK, [ $this, 'process_batch' ] );
     }
 
     /**
@@ -244,77 +262,170 @@ class WCS_GCal_Sync {
     }
 
     // -----------------------------------------------------------------------
-    // Manuálna hromadná synchronizácia
+    // Hromadná synchronizácia na pozadí (dávky cez WP-Cron)
     // -----------------------------------------------------------------------
 
     /**
-     * Synchronizuje VŠETKY publikované podujatia do Google Calendar.
-     * Volá sa z admin stránky cez tlačidlo „Spustiť synchronizáciu".
-     *
-     * @return array{success: int, errors: int}
+     * Synchronizuje jedno podujatie do Google Calendar (create alebo update).
      */
-    public function sync_all(): array {
+    public function sync_post( WP_Post $post ): true|WP_Error {
         $calendar_id = (string) get_option( 'wcs_gcal_calendar_id', '' );
         if ( ! $calendar_id ) {
-            return [ 'success' => 0, 'errors' => 0, 'message' => 'Kalendár nie je vybraný.' ];
+            return new WP_Error( 'no_calendar', 'Kalendár nie je vybraný.' );
         }
 
-        $posts = get_posts( [
+        $event_data = $this->prepare_event_data( $post );
+        if ( ! $event_data ) {
+            return new WP_Error( 'no_timestamp', 'Podujatiu chýba dátum začiatku.' );
+        }
+
+        $gcal_event_id = (string) get_post_meta( $post->ID, self::META_GCAL_EVENT_ID, true );
+
+        if ( $gcal_event_id ) {
+            // Overíme, či event v Google Calendar skutočne existuje
+            $existing = $this->api->get_event( $calendar_id, $gcal_event_id );
+            if ( is_wp_error( $existing ) && ( $existing->get_error_data()['status'] ?? 0 ) === 404 ) {
+                // Event bol vymazaný v Google Calendar – zabudneme na staré ID
+                delete_post_meta( $post->ID, self::META_GCAL_EVENT_ID );
+                $gcal_event_id = '';
+            }
+        }
+
+        if ( $gcal_event_id ) {
+            // Event existuje – aktualizujeme ho
+            $result = $this->api->update_event( $calendar_id, $gcal_event_id, $event_data );
+        } else {
+            // Event neexistuje (ani nikdy nebol synced) – vytvoríme ho
+            $result = $this->api->create_event( $calendar_id, $event_data );
+            if ( ! is_wp_error( $result ) && ! empty( $result['id'] ) ) {
+                update_post_meta( $post->ID, self::META_GCAL_EVENT_ID, $result['id'] );
+            }
+        }
+
+        return is_wp_error( $result ) ? $result : true;
+    }
+
+    /**
+     * Spustí hromadnú synchronizáciu na pozadí: uloží frontu ID podujatí
+     * a naplánuje spracovanie prvej dávky cez WP-Cron.
+     *
+     * @return array{total: int} Počet podujatí vo fronte.
+     */
+    public function start_background_sync(): array {
+        $ids = get_posts( [
             'post_type'      => 'class',
             'post_status'    => [ 'publish', 'private', 'draft' ],
             'posts_per_page' => -1,
             'meta_key'       => '_wcs_timestamp',
             'orderby'        => 'meta_value_num',
             'order'          => 'ASC',
+            'fields'         => 'ids',
         ] );
 
-        $success = 0;
-        $errors  = 0;
+        $job = [
+            'post_ids' => array_map( 'intval', $ids ),
+            'total'    => count( $ids ),
+            'success'  => 0,
+            'errors'   => 0,
+            'started'  => time(),
+        ];
 
-        foreach ( $posts as $post ) {
-            $event_data = $this->prepare_event_data( $post );
-            if ( ! $event_data ) {
-                $errors++;
-                continue;
-            }
+        update_option( self::OPTION_SYNC_JOB, $job, false );
+        delete_option( self::OPTION_LAST_RESULT );
 
-            $gcal_event_id = (string) get_post_meta( $post->ID, self::META_GCAL_EVENT_ID, true );
-            $result        = null;
+        $this->schedule_next_batch( 0 );
+        spawn_cron();
 
-            if ( $gcal_event_id ) {
-                // Overíme, či event v Google Calendar skutočne existuje
-                $existing = $this->api->get_event( $calendar_id, $gcal_event_id );
-                if ( is_wp_error( $existing ) && ( $existing->get_error_data()['status'] ?? 0 ) === 404 ) {
-                    // Event bol vymazaný v Google Calendar – zabudneme na staré ID
-                    delete_post_meta( $post->ID, self::META_GCAL_EVENT_ID );
-                    $gcal_event_id = '';
-                }
-            }
+        return [ 'total' => $job['total'] ];
+    }
 
-            if ( $gcal_event_id ) {
-                // Event existuje – aktualizujeme ho
-                $result = $this->api->update_event( $calendar_id, $gcal_event_id, $event_data );
-            } else {
-                // Event neexistuje (ani nikdy nebol synced) – vytvoríme ho
-                $result = $this->api->create_event( $calendar_id, $event_data );
-                if ( ! is_wp_error( $result ) && ! empty( $result['id'] ) ) {
-                    update_post_meta( $post->ID, self::META_GCAL_EVENT_ID, $result['id'] );
-                }
-            }
+    /**
+     * Zruší bežiacu hromadnú synchronizáciu.
+     */
+    public function cancel_background_sync(): void {
+        delete_option( self::OPTION_SYNC_JOB );
+        wp_clear_scheduled_hook( self::CRON_HOOK );
+    }
 
-            if ( is_wp_error( $result ) ) {
-                $errors++;
-                error_log( sprintf(
-                    '[WCS GCal Sync] Chyba pri sync_all post #%d: %s',
-                    $post->ID,
-                    $result->get_error_message()
-                ) );
-            } else {
-                $success++;
-            }
+    /**
+     * Vráti stav bežiacej hromadnej synchronizácie alebo null.
+     *
+     * @return array{post_ids: int[], total: int, success: int, errors: int, started: int}|null
+     */
+    public function get_job(): ?array {
+        $job = get_option( self::OPTION_SYNC_JOB );
+        return is_array( $job ) && ! empty( $job['total'] ) ? $job : null;
+    }
+
+    /**
+     * Spracuje jednu dávku fronty (volané cez WP-Cron). Po dosiahnutí limitu
+     * dávky alebo času naplánuje ďalší beh; po vyprázdnení fronty uloží výsledok.
+     */
+    public function process_batch(): void {
+        $job = $this->get_job();
+        if ( ! $job || empty( $job['post_ids'] ) ) {
+            return;
         }
 
-        return [ 'success' => $success, 'errors' => $errors ];
+        // Ochrana pred súbežným behom dvoch dávok
+        if ( get_transient( 'wcs_gcal_sync_lock' ) ) {
+            $this->schedule_next_batch( 15 );
+            return;
+        }
+        set_transient( 'wcs_gcal_sync_lock', 1, 90 );
+
+        $deadline  = time() + self::BATCH_TIME_LIMIT;
+        $processed = 0;
+
+        while ( ! empty( $job['post_ids'] ) && $processed < self::BATCH_SIZE && time() < $deadline ) {
+            // Ak bola synchronizácia medzičasom zrušená, neobnovuj frontu
+            wp_cache_delete( self::OPTION_SYNC_JOB, 'options' );
+            if ( false === get_option( self::OPTION_SYNC_JOB ) ) {
+                delete_transient( 'wcs_gcal_sync_lock' );
+                return;
+            }
+
+            $post_id = (int) array_shift( $job['post_ids'] );
+            $post    = get_post( $post_id );
+
+            if ( $post && $post->post_type === 'class' ) {
+                $result = $this->sync_post( $post );
+                if ( is_wp_error( $result ) ) {
+                    $job['errors']++;
+                    error_log( sprintf(
+                        '[WCS GCal Sync] Chyba pri hromadnej synchronizácii post #%d: %s',
+                        $post_id,
+                        $result->get_error_message()
+                    ) );
+                } else {
+                    $job['success']++;
+                }
+            } else {
+                $job['errors']++;
+            }
+
+            $processed++;
+            update_option( self::OPTION_SYNC_JOB, $job, false );
+        }
+
+        delete_transient( 'wcs_gcal_sync_lock' );
+
+        if ( empty( $job['post_ids'] ) ) {
+            update_option( self::OPTION_LAST_RESULT, [
+                'success'  => $job['success'],
+                'errors'   => $job['errors'],
+                'finished' => time(),
+            ], false );
+            delete_option( self::OPTION_SYNC_JOB );
+        } else {
+            $this->schedule_next_batch( 1 );
+        }
+    }
+
+    private function schedule_next_batch( int $delay ): void {
+        if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
+            wp_schedule_single_event( time() + $delay, self::CRON_HOOK );
+        }
     }
 
     // -----------------------------------------------------------------------
