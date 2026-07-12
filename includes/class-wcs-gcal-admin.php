@@ -50,9 +50,13 @@ class WCS_GCal_Admin {
     }
 
     public function register_settings(): void {
-        register_setting( 'wcs_gcal_group', WCS_GCal_Auth::OPTION_CLIENT_ID,     [ 'sanitize_callback' => 'sanitize_text_field' ] );
-        register_setting( 'wcs_gcal_group', WCS_GCal_Auth::OPTION_CLIENT_SECRET, [ 'sanitize_callback' => 'sanitize_text_field' ] );
-        register_setting( 'wcs_gcal_group', 'wcs_gcal_calendar_id',              [ 'sanitize_callback' => 'sanitize_text_field' ] );
+        // Credentials a výber kalendára MUSIA byť v samostatných skupinách:
+        // options.php pri uložení nastaví všetky options danej skupiny, ktoré
+        // vo formulári chýbajú, na null – jedna spoločná skupina preto pri
+        // uložení výberu kalendára vymazala Client ID + Secret (a naopak).
+        register_setting( 'wcs_gcal_credentials_group', WCS_GCal_Auth::OPTION_CLIENT_ID,     [ 'sanitize_callback' => 'sanitize_text_field' ] );
+        register_setting( 'wcs_gcal_credentials_group', WCS_GCal_Auth::OPTION_CLIENT_SECRET, [ 'sanitize_callback' => 'sanitize_text_field' ] );
+        register_setting( 'wcs_gcal_calendar_group',    'wcs_gcal_calendar_id',              [ 'sanitize_callback' => 'sanitize_text_field' ] );
     }
 
     public function enqueue_assets( string $hook ): void {
@@ -92,7 +96,7 @@ class WCS_GCal_Admin {
         $code   = sanitize_text_field( wp_unslash( $_GET['code'] ) );
         $result = $this->auth->handle_callback( $code );
 
-        $redirect = admin_url( 'admin.php?page=wcs-gcal-sync' );
+        $redirect = admin_url( 'options-general.php?page=wcs-gcal-sync' );
 
         if ( is_wp_error( $result ) ) {
             $redirect = add_query_arg( 'wcs_error', rawurlencode( $result->get_error_message() ), $redirect );
@@ -123,7 +127,7 @@ class WCS_GCal_Admin {
         $redirect = add_query_arg( [
             'wcs_sync_success' => $result['success'],
             'wcs_sync_errors'  => $result['errors'],
-        ], admin_url( 'admin.php?page=wcs-gcal-sync' ) );
+        ], admin_url( 'options-general.php?page=wcs-gcal-sync' ) );
 
         wp_safe_redirect( $redirect );
         exit;
@@ -145,7 +149,7 @@ class WCS_GCal_Admin {
 
         $this->auth->disconnect();
 
-        wp_safe_redirect( admin_url( 'admin.php?page=wcs-gcal-sync&wcs_disconnected=1' ) );
+        wp_safe_redirect( admin_url( 'options-general.php?page=wcs-gcal-sync&wcs_disconnected=1' ) );
         exit;
     }
 
@@ -182,12 +186,15 @@ class WCS_GCal_Admin {
         $connected     = $this->auth->is_connected();
         $client_id     = $this->auth->get_client_id();
         $client_secret = $this->auth->get_client_secret();
-        $calendar_id   = (string) get_option( 'wcs_gcal_calendar_id', '' );
-        $calendars     = [];
+        $calendar_id     = (string) get_option( 'wcs_gcal_calendar_id', '' );
+        $calendars       = [];
+        $calendars_error = '';
 
         if ( $connected ) {
             $result = $this->api->get_calendars();
-            if ( ! is_wp_error( $result ) && ! empty( $result['items'] ) ) {
+            if ( is_wp_error( $result ) ) {
+                $calendars_error = $result->get_error_message();
+            } elseif ( ! empty( $result['items'] ) ) {
                 $calendars = $result['items'];
             }
         }
@@ -224,7 +231,7 @@ class WCS_GCal_Admin {
                         </p>
 
                         <form method="post" action="options.php">
-                            <?php settings_fields( 'wcs_gcal_group' ); ?>
+                            <?php settings_fields( 'wcs_gcal_credentials_group' ); ?>
                             <table class="form-table wcs-form-table">
                                 <tr>
                                     <th><label for="wcs_client_id">Client ID</label></th>
@@ -265,7 +272,7 @@ class WCS_GCal_Admin {
                                 <span class="dashicons dashicons-yes-alt"></span>
                                 Úspešne prepojené s Google Calendar
                             </p>
-                            <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin.php?page=wcs-gcal-sync&wcs_gcal_disconnect=1' ), 'wcs_gcal_disconnect' ) ); ?>"
+                            <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'options-general.php?page=wcs-gcal-sync&wcs_gcal_disconnect=1' ), 'wcs_gcal_disconnect' ) ); ?>"
                                class="button button-secondary"
                                onclick="return confirm('Naozaj odpojíte Google Calendar?')">
                                 Odpojiť
@@ -300,9 +307,12 @@ class WCS_GCal_Admin {
                                 Nepodarilo sa načítať zoznam kalendárov.
                                 Skontrolujte oprávnenia Google účtu.
                             </p>
+                            <?php if ( $calendars_error ) : ?>
+                                <p class="description">Odpoveď Google API: <code><?php echo esc_html( $calendars_error ); ?></code></p>
+                            <?php endif; ?>
                         <?php else : ?>
                             <form method="post" action="options.php">
-                                <?php settings_fields( 'wcs_gcal_group' ); ?>
+                                <?php settings_fields( 'wcs_gcal_calendar_group' ); ?>
                                 <table class="form-table wcs-form-table">
                                     <tr>
                                         <th><label for="wcs_calendar_select">Kalendár</label></th>
